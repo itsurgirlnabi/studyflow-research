@@ -8,6 +8,7 @@ let participant = null;
 let activeSession = null;
 let activeStartedAt = null;
 let timerIsRunning = false;
+let progressResetAt = null;
 
 function notice(message) { window.toast(message); }
 function isConfigured() { return Boolean(supabase); }
@@ -15,6 +16,7 @@ function codeEmail(code) { return `${code.toLowerCase()}@participant.studyflow.i
 function pending() { return JSON.parse(localStorage.getItem('studyflow-pending') || '[]'); }
 function queue(item) { localStorage.setItem('studyflow-pending', JSON.stringify([...pending(), item])); }
 async function flushPending() { for (const item of pending()) { const { error } = item.kind === 'task' ? await supabase.from('tasks').insert(item.data) : await supabase.from('focus_sessions').update(item.data).eq('id', item.id).eq('completed', false); if (!error) localStorage.setItem('studyflow-pending', JSON.stringify(pending().filter(x => JSON.stringify(x) !== JSON.stringify(item)))); } }
+async function loadUiState() { const { data } = await supabase.from('participant_ui_state').select('progress_reset_at').maybeSingle(); progressResetAt = data?.progress_reset_at || null; }
 
 function addAuthFields() {
   const privacy = document.querySelector('.privacy');
@@ -30,13 +32,36 @@ function addAuthFields() {
 async function loadTasks() {
   const { data, error } = await supabase.from('tasks').select('*').order('created_at', { ascending: false });
   if (error) return notice('Could not load your tasks. Please retry.');
+  const visibleTasks = progressResetAt ? data.filter(task => task.created_at >= progressResetAt) : data;
   const list = $('taskList'); list.replaceChildren();
-  data.forEach(drawTask);
-  const completed = data.filter(t => t.completed).length;
-  $('completedStat').textContent = completed;
-  $('remainingStat').textContent = data.length - completed;
-  const current = data.find(t => !t.completed);
+  visibleTasks.forEach(drawTask);
+  const current = visibleTasks.find(t => !t.completed);
   if (current) setCurrentTask(current);
+  await loadProductivity(visibleTasks);
+}
+async function loadProductivity(tasks) {
+  const today = new Date().toISOString().slice(0, 10);
+  const { data, error } = await supabase.from('daily_productivity').select('*').eq('participant_id', participant.id).eq('date', today).maybeSingle();
+  if (error) return;
+  let daily = data || { tasks_completed: 0, focused_minutes: 0, pomodoro_sessions: 0 };
+  if (progressResetAt) {
+    const start = new Date(Math.max(new Date(progressResetAt).getTime(), new Date(`${today}T00:00:00`).getTime())).toISOString();
+    const { data: sessions } = await supabase.from('focus_sessions').select('actual_duration').eq('completed', true).gte('ended_at', start);
+    daily = {
+      tasks_completed: tasks.filter(task => task.completed && task.completed_at && task.completed_at >= start).length,
+      focused_minutes: (sessions || []).reduce((total, session) => total + Math.ceil(session.actual_duration / 60), 0),
+      pomodoro_sessions: (sessions || []).length,
+    };
+  }
+  $('completedStat').textContent = daily.tasks_completed;
+  $('remainingStat').textContent = tasks.filter(t => !t.completed).length;
+  $('focusedStat').textContent = daily.focused_minutes;
+  $('sessionStat').textContent = daily.pomodoro_sessions;
+  $('progressTasks').textContent = daily.tasks_completed;
+  $('progressFocused').textContent = daily.focused_minutes;
+  $('progressSessions').textContent = `${daily.pomodoro_sessions} 🍅`;
+  $('progressNote').textContent = daily.tasks_completed ? 'today' : 'no completed tasks yet';
+  $('progressChart').innerHTML = daily.tasks_completed ? `<div class="bar-wrap"><i class="bar hot" style="height:100%"></i>Today</div>` : '<p class="sub">No study activity yet.</p>';
 }
 function drawTask(task) {
   const item = document.createElement('article'); item.className = `task card${task.completed ? ' done' : ''}`; item.dataset.id = task.id;
@@ -64,7 +89,7 @@ async function signIn() {
   if (error) return notice('We could not sign you in. Check your code and PIN.');
   const { data, error: participantError } = await supabase.from('participants').select('*').single();
   if (participantError) { await supabase.auth.signOut(); return notice('This account is not enrolled as a participant.'); }
-  participant = data; $('userName').textContent = participant.participant_code; $('welcome').classList.remove('active'); window.show('home'); await loadTasks(); await researchPanel();
+  participant = data; $('userName').textContent = participant.participant_code; $('welcome').classList.remove('active'); window.show('home'); await loadUiState(); await loadTasks(); await researchPanel();
 }
 
 async function createTask() {
@@ -101,12 +126,32 @@ async function baselineEntry() {
   if (error) return notice('Could not save your baseline entry. Please retry.');
   notice('Today’s baseline entry was saved! ✨');
 }
+async function resetMyProgress() {
+  await stopSession(); timerIsRunning = false; originalStop();
+  const { data, error } = await supabase.rpc('reset_my_progress');
+  if (error) return notice(`Could not reset your progress: ${error.message}`);
+  progressResetAt = data; await loadTasks(); window.show('home'); notice('Your StudyFlow progress has been reset. Research records were kept.');
+}
+function showProgressResetDialog() {
+  let dialog = $('progressResetModal');
+  if (!dialog) {
+    dialog = document.createElement('dialog'); dialog.id = 'progressResetModal';
+    dialog.style.cssText = 'border:0;border-radius:22px;box-shadow:0 18px 55px #4a303066;max-width:390px;width:calc(100% - 32px);color:#4a3030;padding:24px;font-family:Nunito,sans-serif';
+    dialog.innerHTML = '<h2 style="font-family:Patrick Hand,cursive;font-size:31px;line-height:1;margin:0">Reset your progress?</h2><p style="color:#8b7070;font-weight:700;line-height:1.5">Your StudyFlow progress will be reset. This will not sign you out.</p><div style="display:flex;justify-content:flex-end;gap:10px;margin-top:18px"><button class="btn btn-outline" id="progressResetCancel">Cancel</button><button class="btn btn-pink" id="progressResetConfirm">Reset My Progress</button></div>';
+    document.body.append(dialog);
+    $('progressResetCancel').onclick = () => dialog.close();
+    $('progressResetConfirm').onclick = async () => { $('progressResetConfirm').disabled = true; await resetMyProgress(); $('progressResetConfirm').disabled = false; dialog.close(); };
+  }
+  dialog.showModal();
+}
 async function researchPanel() {
   const { data, error } = await supabase.rpc('current_period', { for_date: new Date().toISOString().slice(0, 10) });
   const panel = $('more');
   const baseline = !error && data === 'BASELINE';
-  panel.innerHTML = `<h1 class="page-title">${baseline ? 'daily check-in ✿' : 'study privacy ♡'}</h1>${baseline ? '<div class="card"><h2 class="card-title">baseline period</h2><p class="sub">How many study tasks did you complete today?</p><input id="baselineCount" class="input" type="number" min="0" max="99" value="0" inputmode="numeric"><button class="btn btn-pink form-btn" id="baselineSave">Save today’s count ✨</button></div>' : ''}<div class="card"><h2 class="card-title">your study privacy</h2><p class="sub">Your activity is linked to an anonymous participant code and used only for the approved school research study. Researchers can view authorized study records; other participants cannot see your tasks or activity.</p></div>`;
+  panel.innerHTML = `<h1 class="page-title">${baseline ? 'daily check-in ✿' : 'study privacy ♡'}</h1>${baseline ? '<div class="card"><h2 class="card-title">baseline period</h2><p class="sub">How many study tasks did you complete today?</p><input id="baselineCount" class="input" type="number" min="0" max="99" value="0" inputmode="numeric"><button class="btn btn-pink form-btn" id="baselineSave">Save today’s count ✨</button></div>' : ''}<div class="card"><h2 class="card-title">your study privacy</h2><p class="sub">Your activity is linked to an anonymous participant code and used only for the approved school research study. Researchers can view authorized study records; other participants cannot see your tasks or activity.</p><button class="btn btn-yellow form-btn" id="progressReset">Reset My Progress</button><button class="btn btn-outline form-btn" id="participantSignOut">Sign out</button></div>`;
   if (baseline) $('baselineSave').onclick = baselineEntry;
+  $('progressReset').onclick = showProgressResetDialog;
+  $('participantSignOut').onclick = async () => { await supabase.auth.signOut(); location.reload(); };
 }
 
 window.startApp = signIn;
@@ -118,4 +163,4 @@ window.stopTimer = async () => { await stopSession(); timerIsRunning = false; or
 window.toggleBreak = finishSession;
 
 addAuthFields();
-if (supabase) supabase.auth.getSession().then(async ({ data: { session } }) => { if (!session) return; const { data } = await supabase.from('participants').select('*').maybeSingle(); if (data) { participant = data; $('userName').textContent = data.participant_code; $('welcome').classList.remove('active'); window.show('home'); await flushPending(); await loadTasks(); await researchPanel(); } });
+if (supabase) supabase.auth.getSession().then(async ({ data: { session } }) => { if (!session) return; const { data } = await supabase.from('participants').select('*').maybeSingle(); if (data) { participant = data; $('userName').textContent = data.participant_code; $('welcome').classList.remove('active'); window.show('home'); await flushPending(); await loadUiState(); await loadTasks(); await researchPanel(); } });
