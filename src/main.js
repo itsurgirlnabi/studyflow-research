@@ -24,9 +24,12 @@ function addAuthFields() {
   pin.innerHTML = '<label class="label" for="studyPin">Enter your private study PIN ♡</label><input class="input" id="studyPin" type="password" inputmode="numeric" minlength="8" maxlength="72" autocomplete="current-password" placeholder="Given to you by the researcher">';
   privacy.before(pin);
   privacy.textContent = 'Your study activity is recorded under this anonymous code for the approved school research study. This wording will be replaced with the school-approved notice.';
+  const signUpButton = document.createElement('button');
+  signUpButton.className = 'btn btn-yellow'; signUpButton.textContent = 'Create Participant Account ✨';
+  signUpButton.style.marginTop = '10px'; signUpButton.onclick = signUp;
   const researcher = document.createElement('a');
   researcher.href = '/researcher.html'; researcher.textContent = 'Researcher sign in →'; researcher.style.cssText = 'margin-top:14px;color:var(--pink);font-size:12px;font-weight:900;text-decoration:none';
-  document.querySelector('.welcome .btn').after(researcher);
+  document.querySelector('.welcome .btn').after(signUpButton, researcher);
 }
 
 async function loadTasks() {
@@ -90,6 +93,18 @@ async function signIn() {
   const { data, error: participantError } = await supabase.from('participants').select('*').single();
   if (participantError) { await supabase.auth.signOut(); return notice('This account is not enrolled as a participant.'); }
   participant = data; $('userName').textContent = participant.participant_code; $('welcome').classList.remove('active'); window.show('home'); await loadUiState(); await loadTasks(); await researchPanel();
+}
+
+async function signUp() {
+  const code = $('anon').value.trim().toUpperCase(); const pin = $('studyPin').value;
+  if (!/^[A-Z0-9-]{3,32}$/.test(code) || pin.length < 8) return notice('Choose a code and a private PIN with at least 8 characters.');
+  if (!isConfigured()) return notice('Supabase is not configured yet. See README.');
+  const { data, error } = await supabase.auth.signUp({ email: codeEmail(code), password: pin, options: { data: { participant_code: code } } });
+  if (error) return notice(error.message.toLowerCase().includes('duplicate') ? 'That participant code is already in use.' : 'Could not create your account. Please try another code.');
+  if (!data.session) return notice('Account created. Email confirmation is enabled in Supabase, so ask the researcher to disable it for participant accounts.');
+  const { data: participantData, error: participantError } = await supabase.from('participants').select('*').single();
+  if (participantError) return notice('Your account was created, but the participant record is still being prepared. Please sign in again.');
+  participant = participantData; $('userName').textContent = participant.participant_code; $('welcome').classList.remove('active'); window.show('home'); await loadUiState(); await loadTasks(); await researchPanel(); notice('Your participant account is ready! ✨');
 }
 
 async function createTask() {
